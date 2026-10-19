@@ -1,0 +1,436 @@
+#!/bin/bash
+set -o pipefail
+ORG=rlqry
+CHECKOUT="$HOME/.reliquary"
+STATE="$HOME/.local/state/ignition"
+MARKER="$HOME/.local/state/reliquary/hub.toml"
+CLT=/Library/Developer/CommandLineTools
+HELPER="$CLT/usr/libexec/git-core/git-credential-osxkeychain"
+KEEP_LOGS=10
+OWNED_APP=Iv23liAJsy8RBRLBTsKh
+
+ui_init() {
+    if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+        B=$'\033[1m' D=$'\033[2m' G=$'\033[32m' R=$'\033[31m' Y=$'\033[33m' Z=$'\033[0m'
+    else
+        B='' D='' G='' R='' Y='' Z=''
+    fi
+    mkdir -p "$STATE" || exit 3
+    LOG="$STATE/$(date -u +%Y%m%dT%H%M%SZ).log"
+    : >"$LOG" || exit 3
+    ln -sfn "$(basename "$LOG")" "$STATE/latest"
+    set -- "$STATE"/*.log
+    while [ $# -gt "$KEEP_LOGS" ]; do
+        rm -f "$1"
+        shift
+    done
+    export IGNITION_LOG="$LOG"
+}
+
+say() { printf '%s\n' "$*" >&2; }
+
+log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >>"$LOG"; }
+
+ok() { say "$G✓$Z $1${2:+ $D$2$Z}"; }
+
+die() {
+    say "$R✗$Z $1"
+    [ -n "${2:-}" ] && say "  $2"
+    [ -n "${LOG:-}" ] && say "  ${D}log: $LOG$Z" && log "FAILED: $1"
+    exit 2
+}
+
+step() {
+    local title="$1" from pid status start frames i=0
+    shift
+    log "== $title"
+    from=$(wc -c <"$LOG")
+    start=$SECONDS
+    "$@" </dev/null >>"$LOG" 2>&1 &
+    pid=$!
+    if [ -t 2 ]; then
+        frames='|/-\'
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r%s %s %s%ds%s' "${frames:i++%4:1}" "$title" "$D" $((SECONDS - start)) "$Z" >&2
+            sleep 0.1
+        done
+        printf '\r\033[K' >&2
+    fi
+    wait "$pid"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        say "$R✗$Z $title ${D}exit $status$Z"
+        tail -c +$((from + 1)) "$LOG" | tail -n 20 | sed 's/^/  │ /' >&2
+        say "  rerun the same command; it resumes"
+        say "  ${D}log: $LOG$Z"
+        log "FAILED: $title"
+        exit 2
+    fi
+    ok "$title" "$((SECONDS - start))s"
+}
+CUSTODY=''
+CUSTODY_GIVEN=''
+TENANT=''
+APP=''
+PASSWORD_FD=''
+NO_PASSWORD=''
+PASSWORD=''
+TOKEN=''
+
+usage() {
+    say "usage: ignite [--custody owned|foreign] [--tenant <slug> --app <client-id>]"
+    say "              [--password-fd N | --no-password]"
+    say "       RLQRY_TOKEN=<token> skips GitHub's device flow"
+    exit 2
+}
+
+parse() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --custody)
+                [ $# -ge 2 ] || usage
+                CUSTODY="$2"
+                CUSTODY_GIVEN=1
+                shift 2
+                ;;
+            --tenant)
+                [ $# -ge 2 ] || usage
+                TENANT="$2"
+                shift 2
+                ;;
+            --app)
+                [ $# -ge 2 ] || usage
+                APP="$2"
+                shift 2
+                ;;
+            --password-fd)
+                [ $# -ge 2 ] || usage
+                PASSWORD_FD="$2"
+                shift 2
+                ;;
+            --no-password)
+                NO_PASSWORD=1
+                shift
+                ;;
+            *) usage ;;
+        esac
+    done
+    case "$PASSWORD_FD" in '' | [0-9]) ;; *) usage ;; esac
+}
+
+attended() { { : </dev/tty; } 2>/dev/null; }
+
+ask() {
+    local answer
+    printf '%s' "$1" >/dev/tty
+    IFS= read -r answer </dev/tty || return 1
+    printf '%s' "$answer"
+}
+
+valid_slug() {
+    case "$1" in
+        '' | -* | *[!abcdefghijklmnopqrstuvwxyz0123456789-]*) return 1 ;;
+    esac
+}
+
+valid_client_id() {
+    case "$1" in
+        Iv??????????????????) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+    esac
+}
+
+declared() {
+    [ -f "$MARKER" ] || return 0
+    sed -nE 's/^custody = "(owned|foreign)"$/\1/p' "$MARKER"
+}
+
+declared_tenant() {
+    set -- "$CHECKOUT"/tenants/*/
+    [ $# -eq 1 ] && [ -d "$1" ] && basename "$1"
+}
+
+declared_app() {
+    [ -f "$CHECKOUT/tenants/$1/tenant.toml" ] || return 0
+    sed -n 's/^client-id = "\(.*\)"$/\1/p' "$CHECKOUT/tenants/$1/tenant.toml"
+}
+
+is_admin() { id -Gn | tr ' ' '\n' | grep -qx admin; }
+
+choose_custody() {
+    local was
+    was=$(declared)
+    if [ -z "$CUSTODY" ]; then
+        if attended; then
+            say "${B}Custody$Z — ${D}owned, or foreign: someone else's machine$Z"
+            CUSTODY=$(ask "  custody${was:+ [$was]}: ") || die "no answer"
+        fi
+        CUSTODY="${CUSTODY:-$was}"
+    fi
+    [ -n "$CUSTODY" ] || die "custody unknown" "pass --custody owned|foreign"
+    case "$CUSTODY" in
+        owned | foreign) ;;
+        *) die "not a custody: $CUSTODY" "owned, or foreign" ;;
+    esac
+    if [ -n "$was" ] && [ "$CUSTODY" != "$was" ] && [ -z "$CUSTODY_GIVEN" ]; then
+        die "this hub is declared $was, not $CUSTODY" "to change it, pass --custody $CUSTODY"
+    fi
+    if [ "$CUSTODY" = owned ]; then
+        [ -z "$TENANT$APP" ] || die "--tenant and --app are a foreign machine's" "drop them, or pass --custody foreign"
+        CLIENT_ID=$OWNED_APP
+        ok "custody" "owned"
+    else
+        choose_tenant
+        ok "custody" "foreign, $TENANT"
+    fi
+}
+
+choose_tenant() {
+    TENANT="${TENANT:-$(declared_tenant)}"
+    [ -n "$TENANT" ] && APP="${APP:-$(declared_app "$TENANT")}"
+    if [ -z "$TENANT" ] || [ -z "$APP" ]; then
+        attended || die "a foreign machine ignites from an invitation" 'run `tenant invite <slug>` on a hub, then the line it prints here'
+        say "${B}Invitation$Z — ${D}the tenant and app a hub's \`tenant invite\` printed$Z"
+        [ -n "$TENANT" ] || TENANT=$(ask "  tenant: ") || die "no answer"
+        [ -n "$APP" ] || APP=$(ask "  app: ") || die "no answer"
+    fi
+    valid_slug "$TENANT" || die "not a tenant name: $TENANT"
+    valid_client_id "$APP" || die "not a GitHub App client id: $APP" "copy it from the invitation"
+    CLIENT_ID=$APP
+}
+
+sudo_needs_tty() { [ -e /etc/sudoers.d/tend ] && ! attended; }
+
+password_ok() {
+    printf '%s\n' "$1" | sudo -S -k -p '' -v 2>/dev/null
+    local status=$?
+    sudo -k
+    return "$status"
+}
+
+choose_password() {
+    local tries=0
+    if [ -n "$PASSWORD_FD" ]; then
+        IFS= read -r PASSWORD <&"$PASSWORD_FD" || [ -n "$PASSWORD" ] || die "nothing on --password-fd $PASSWORD_FD"
+        if sudo_needs_tty; then
+            ok "password" "held for tend, which checks it on its own terminal"
+            return
+        fi
+        password_ok "$PASSWORD" || die "sudo refused the password on --password-fd $PASSWORD_FD"
+        ok "password" "checked"
+        return
+    fi
+    if [ -n "$NO_PASSWORD" ] || ! is_admin; then
+        [ "$CUSTODY" = owned ] && die "an owned hub needs an administrator's password"
+        ok "password" "none: Apple's dialogs ask instead"
+        return
+    fi
+    attended || die "the macOS password is needed" "pass --password-fd N, or --no-password on a tenant's hub"
+    say "${B}macOS password$Z — ${D}held in memory for this run, handed to tend on a pipe$Z"
+    while [ $tries -lt 3 ]; do
+        printf '  password%s: ' "$([ "$CUSTODY" = owned ] || printf ' (empty to skip)')" >/dev/tty
+        IFS= read -rs PASSWORD </dev/tty
+        printf '\n' >/dev/tty
+        if [ -z "$PASSWORD" ] && [ "$CUSTODY" != owned ]; then
+            ok "password" "skipped"
+            return
+        fi
+        password_ok "$PASSWORD" && ok "password" "checked" && return
+        tries=$((tries + 1))
+        say "  ${Y}sudo refused it$Z"
+    done
+    die "three refusals"
+}
+
+json_field() { plutil -extract "$1" raw -o - - 2>/dev/null; }
+
+reaches() { thrice reach_once "$@"; }
+
+reach_once() {
+    printf 'user = "%s:%s"\n' "$ORG" "$1" | curl -K - -fsS -o /dev/null --max-time 20 \
+        "https://github.com/$ORG/$2.git/info/refs?service=git-$3" 2>>"${LOG:-/dev/null}"
+}
+
+token_reaches() {
+    if [ "$CUSTODY" = owned ]; then
+        reaches "$1" core receive-pack
+    else
+        reaches "$1" core upload-pack && reaches "$1" "tenant-$TENANT" upload-pack
+    fi
+}
+
+stored_token() {
+    [ -x "$HELPER" ] || return 1
+    printf 'protocol=https\nhost=github.com\nusername=%s\n\n' "$ORG" | GIT_TERMINAL_PROMPT=0 git_rlqry credential fill 2>/dev/null | sed -n 's/^password=//p'
+}
+
+device_flow() {
+    local start device code interval expires polled waited=0 error
+    attended || die "GitHub cannot be asked unattended" "set RLQRY_TOKEN"
+    start=$(curl -fsS --max-time 20 -X POST -H 'Accept: application/json' \
+        -d "client_id=$CLIENT_ID" https://github.com/login/device/code) || die "GitHub's device flow did not start"
+    device=$(printf '%s' "$start" | json_field device_code)
+    code=$(printf '%s' "$start" | json_field user_code)
+    interval=$(printf '%s' "$start" | json_field interval)
+    expires=$(printf '%s' "$start" | json_field expires_in)
+    [ -n "$device" ] && [ -n "$code" ] || die "GitHub's device flow answered oddly: $start"
+    printf '%s' "$code" | pbcopy 2>/dev/null
+    say "${B}GitHub$Z — on a signed-in device, open ${B}https://github.com/login/device$Z"
+    say "  and enter $B$code$Z $D(copied)$Z"
+    say "  ${D}Enter only a code this terminal printed just now.$Z"
+    while [ "$waited" -lt "${expires:-900}" ]; do
+        sleep "${interval:-5}"
+        waited=$((waited + ${interval:-5}))
+        polled=$(curl -fsS --max-time 20 -X POST -H 'Accept: application/json' \
+            -d "client_id=$CLIENT_ID" -d "device_code=$device" \
+            -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+            https://github.com/login/oauth/access_token) || continue
+        TOKEN=$(printf '%s' "$polled" | json_field access_token)
+        if [ -n "$TOKEN" ]; then
+            [ -z "$(printf '%s' "$polled" | json_field refresh_token)" ] || die "the app issues expiring tokens" 'on a hub, `tenant provision` (or `tenant onboard --owned`) names the fix'
+            return 0
+        fi
+        error=$(printf '%s' "$polled" | json_field error)
+        case "$error" in
+            authorization_pending) ;;
+            slow_down) interval=$((${interval:-5} + 5)) ;;
+            *) die "GitHub refused: ${error:-$polled}" ;;
+        esac
+    done
+    die "the code expired"
+}
+
+choose_token() {
+    if [ -n "${RLQRY_TOKEN:-}" ]; then
+        TOKEN="$RLQRY_TOKEN"
+        unset RLQRY_TOKEN
+        token_reaches "$TOKEN" || die "RLQRY_TOKEN does not reach what $CUSTODY needs"
+        ok "GitHub" "token from the environment"
+        return
+    fi
+    TOKEN=$(stored_token)
+    if [ -n "$TOKEN" ] && token_reaches "$TOKEN"; then
+        ok "GitHub" "stored credential"
+        return
+    fi
+    device_flow
+    token_reaches "$TOKEN" || die "the approved token does not reach what $CUSTODY needs" "is the app installed on core$([ "$CUSTODY" = owned ] || printf ' and tenant-%s' "$TENANT")?"
+    ok "GitHub" "approved"
+}
+
+git_rlqry() {
+    "$CLT/usr/bin/git" -c credential.helper= -c "credential.helper=$HELPER" \
+        -c "url.https://$ORG@github.com/$ORG/.insteadOf=https://github.com/$ORG/" "$@"
+}
+
+clt_present() { [ -x "$CLT/usr/bin/git" ] && [ -x "$HELPER" ]; }
+
+as_root() { printf '%s\n' "$PASSWORD" | sudo -S -p '' "$@"; }
+
+clt_headless() {
+    local marker=/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress label status
+    as_root touch "$marker" || return 1
+    label=$(softwareupdate -l 2>/dev/null | grep -B 1 -E 'Command Line Tools' | awk -F'*' '/^ *\*/ { print $2 }' | sed -e 's/^ *Label: //' -e 's/^ *//' | sort -V | tail -n 1)
+    if [ -n "$label" ]; then
+        echo "installing $label"
+        as_root softwareupdate -i "$label" && as_root xcode-select --switch "$CLT"
+        status=$?
+    else
+        echo "softwareupdate lists no Command Line Tools"
+        status=1
+    fi
+    as_root rm -f "$marker"
+    sudo -k
+    return "$status"
+}
+
+clt_dialog() {
+    local waited=0
+    xcode-select --install >/dev/null 2>&1
+    say "  ${Y}Apple's dialog is open: choose Install, then wait here$Z"
+    while ! clt_present; do
+        sleep 5
+        waited=$((waited + 5))
+        [ "$waited" -lt 3600 ] || die "the Command Line Tools did not arrive within an hour"
+    done
+}
+
+ensure_clt() {
+    if clt_present; then
+        ok "Command Line Tools" "present"
+    elif [ -n "$PASSWORD" ]; then
+        sudo_needs_tty && die "the Command Line Tools are missing" "sudo here needs a terminal: run ignite from one"
+        step "Command Line Tools" clt_headless
+    else
+        attended || die "the Command Line Tools are missing" "install them, or pass --password-fd N"
+        clt_dialog
+        ok "Command Line Tools"
+    fi
+}
+
+store_token() {
+    printf 'protocol=https\nhost=github.com\nusername=%s\npassword=%s\n\n' "$ORG" "$TOKEN" | git_rlqry credential approve
+}
+
+thrice() { "$@" || { sleep 3 && "$@"; } || { sleep 10 && "$@"; }; }
+
+converge_checkout() {
+    local dir="$1" repo="$2"
+    if [ -d "$dir/.git" ]; then
+        thrice git_rlqry -C "$dir" fetch --quiet origin && if [ -z "$(git_rlqry -C "$dir" status --porcelain)" ]; then
+            git_rlqry -C "$dir" merge --ff-only --quiet '@{upstream}'
+        else
+            echo "$dir has local changes; left as it is"
+        fi
+    elif [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+        echo "$dir exists and is not a checkout"
+        return 1
+    else
+        mkdir -p "$(dirname "$dir")" && thrice git_rlqry clone --quiet "https://github.com/$ORG/$repo.git" "$dir"
+    fi
+}
+
+handoff() {
+    local stage1="$CHECKOUT/ignition/ignite"
+    [ -f "$stage1" ] || die "core has no stage 1 at $stage1"
+    say "${B}stage 1$Z"
+    log "exec stage 1 --custody $CUSTODY"
+    if [ -n "$PASSWORD" ]; then
+        exec /bin/bash "$stage1" --custody "$CUSTODY" --elevation-fd 3 3< <(printf '%s\n' "$PASSWORD")
+    fi
+    exec /bin/bash "$stage1" --custody "$CUSTODY"
+}
+
+preflight() {
+    [ "$(uname -s)" = Darwin ] || die "macOS only"
+    [ "$(uname -m)" = arm64 ] || die "Apple silicon only"
+    [ "$(id -u)" -ne 0 ] || die "run as yourself, not root"
+    local said
+    said=$(curl -fsS -o /dev/null --max-time 10 https://github.com 2>&1) || die "github.com is out of reach: ${said:-curl said nothing}"
+    if ! clt_present && ! is_admin; then
+        say "  ${Y}Without administrator rights the Command Line Tools must come from your$Z"
+        say "  ${Y}employer (preinstalled, or a self-service catalog); Apple's dialog may refuse.$Z"
+    fi
+}
+
+main() {
+    parse "$@"
+    ui_init
+    say "${B}Reliquary ignition$Z $D· log $LOG$Z"
+    preflight
+    choose_custody
+    choose_password
+    choose_token
+    say "${D}Everything asked; the rest runs unattended.$Z"
+    ensure_clt
+    step "GitHub credential" store_token
+    step "core" converge_checkout "$CHECKOUT" core
+    if [ "$CUSTODY" != owned ]; then
+        step "tenant $TENANT" converge_checkout "$CHECKOUT/tenants/$TENANT" "tenant-$TENANT"
+    fi
+    handoff
+}
+[ -n "${IGNITE_LIB:-}" ] || main "$@"
